@@ -3,6 +3,11 @@ This implements the AzureBlockBlobStore for `azure-storage-blob~=12`
 """
 import io
 from contextlib import contextmanager
+from unittest import mock
+
+from azure.core.exceptions import AzureError
+from azure.storage.blob import BlobServiceClient, ContentSettings
+import msrest.serialization
 
 from .._compat import PY2
 from .. import KeyValueStore
@@ -29,8 +34,6 @@ else:
 @contextmanager
 def map_azure_exceptions(key=None, error_codes_pass=()):
     """Map Azure-specific exceptions to the simplekv-API."""
-    from azure.core.exceptions import AzureError
-
     try:
         yield
     except AzureError as ex:
@@ -40,6 +43,34 @@ def map_azure_exceptions(key=None, error_codes_pass=()):
         if error_code == "BlobNotFound":
             raise KeyError(key)
         raise IOError(str(ex))
+
+
+class BlobItemNameOnly(msrest.serialization.Model):
+
+    _attribute_map = {
+        'name': {'key': 'Name', 'type': 'str'},
+    }
+    _xml_map = {
+        'name': 'Blob'
+    }
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        **kwargs
+    ):
+        super(BlobItemNameOnly, self).__init__(**kwargs)
+        self.name = name
+
+
+@contextmanager
+def _patch_blob_deserializer(fast_list_blobs, container_client):
+    if fast_list_blobs:
+        with mock.patch.dict(container_client._client._deserialize.dependencies, {"BlobItemInternal": BlobItemNameOnly}):
+            yield
+    else:
+        yield
 
 
 class AzureBlockBlobStore(KeyValueStore):
@@ -54,6 +85,7 @@ class AzureBlockBlobStore(KeyValueStore):
         max_single_put_size=None,
         checksum=False,
         socket_timeout=None,
+        fast_list_blobs=False,
     ):
         """
         Note that socket_timeout is unused;
@@ -67,6 +99,7 @@ class AzureBlockBlobStore(KeyValueStore):
         self.max_block_size = max_block_size
         self.max_single_put_size = max_single_put_size
         self.checksum = checksum
+        self.fast_list_blobs = fast_list_blobs
 
     # Using @lazy_property will (re-)create block_blob_service instance needed.
     # Together with the __getstate__ implementation below, this allows
@@ -74,7 +107,7 @@ class AzureBlockBlobStore(KeyValueStore):
     # azure.storage.blob.BlockBlobService does not support pickling.
     @lazy_property
     def blob_container_client(self):
-        from azure.storage.blob import BlobServiceClient
+
 
         kwargs = {}
         if self.max_single_put_size:
@@ -112,22 +145,26 @@ class AzureBlockBlobStore(KeyValueStore):
         return False
 
     def iter_keys(self, prefix=None):
-        with map_azure_exceptions():
-            blobs = self.blob_container_client.list_blobs(name_starts_with=prefix)
+        cc = self.blob_container_client
 
         def gen_names():
-            with map_azure_exceptions():
+            with map_azure_exceptions(), _patch_blob_deserializer(self.fast_list_blobs, cc):
+                blobs = cc.list_blobs(name_starts_with=prefix)
                 for blob in blobs:
                     yield _blobname_to_texttype(blob.name)
         return gen_names()
 
     def iter_prefixes(self, delimiter, prefix=u""):
-        return (
-            _blobname_to_texttype(blob_prefix.name)
-            for blob_prefix in self.blob_container_client.walk_blobs(
-                name_starts_with=prefix, delimiter=delimiter
-            )
-        )
+        cc = self.blob_container_client
+
+        def gen_names():
+            with map_azure_exceptions(), _patch_blob_deserializer(self.fast_list_blobs, cc):
+                blobs = cc.walk_blobs(
+                    name_starts_with=prefix, delimiter=delimiter
+                )
+                for blob in blobs:
+                    yield _blobname_to_texttype(blob.name)
+        return gen_names()
 
     def _open(self, key):
         with map_azure_exceptions(key):
@@ -135,8 +172,6 @@ class AzureBlockBlobStore(KeyValueStore):
             return IOInterface(blob_client, self.max_connections)
 
     def _put(self, key, data):
-        from azure.storage.blob import ContentSettings
-
         if self.checksum:
             content_settings = ContentSettings(
                 content_md5=_byte_buffer_md5(data, b64encode=False)
@@ -156,8 +191,6 @@ class AzureBlockBlobStore(KeyValueStore):
         return key
 
     def _put_file(self, key, file):
-        from azure.storage.blob import ContentSettings
-
         if self.checksum:
             content_settings = ContentSettings(content_md5=_file_md5(file, b64encode=False))
         else:
